@@ -4,7 +4,7 @@ echo 'Starting Aphrodite Engine API server...'
 
 CMD="python3 -m aphrodite.endpoints.aws.api_server
              --host 0.0.0.0
-             --port 80
+             --port 8080
              --download-dir ${HF_HOME:?}/hub
              ${MODEL_NAME:+--model $MODEL_NAME}
              ${REVISION:+--revision $REVISION}
