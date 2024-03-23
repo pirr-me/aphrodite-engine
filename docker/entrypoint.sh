@@ -2,9 +2,9 @@
 
 echo 'Starting Aphrodite Engine API server...'
 
-CMD="python3 -m aphrodite.endpoints.openai.api_server
+CMD="python3 -m aphrodite.endpoints.aws.api_server
              --host 0.0.0.0
-             --port 7860
+             --port 80
              --download-dir ${HF_HOME:?}/hub
              ${MODEL_NAME:+--model $MODEL_NAME}
              ${REVISION:+--revision $REVISION}
