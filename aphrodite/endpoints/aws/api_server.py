@@ -162,7 +162,7 @@ async def validation_exception_handler(_, exc):
     return JSONResponse(err.model_dump(), status_code=HTTPStatus.BAD_REQUEST)
 
 
-@app.get("/health")
+@app.get("/ping")
 async def health() -> Response:
     """Health check."""
     return Response(status_code=200)
