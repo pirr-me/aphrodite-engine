@@ -5,10 +5,10 @@ from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import (AliasChoices, BaseModel, Field, model_validator,
                       root_validator)
-import torch
 
 from aphrodite.common.utils import random_uuid
 from aphrodite.common.sampling_params import SamplingParams
+from aphrodite.common.logits_processor import BiasLogitsProcessor
 
 
 class ErrorResponse(BaseModel):
@@ -53,6 +53,11 @@ class UsageInfo(BaseModel):
     prompt_tokens: int = 0
     total_tokens: int = 0
     completion_tokens: Optional[int] = 0
+
+
+class ResponseFormat(BaseModel):
+    # type must be "json_object" or "text"
+    type: str = Literal["text", "json_object"]
 
 
 class ChatCompletionRequest(BaseModel):
@@ -102,24 +107,21 @@ class ChatCompletionRequest(BaseModel):
     guided_json: Optional[Union[str, dict, BaseModel]] = None
     guided_regex: Optional[str] = None
     guided_choice: Optional[List[str]] = None
+    guided_grammar: Optional[str] = None
+    response_format: Optional[ResponseFormat] = None
 
-    def to_sampling_params(self) -> SamplingParams:
+    def to_sampling_params(self, vocab_size: int) -> SamplingParams:
         if self.logprobs and not self.top_logprobs:
             raise ValueError("Top logprobs must be set when logprobs is.")
 
-        logits_processors = None
+        logits_processors = []
         if self.logit_bias:
-
-            def logit_bias_logits_processor(
-                    token_ids: List[int],
-                    logits: torch.Tensor) -> torch.Tensor:
-                for token_id, bias in self.logit_bias.items():
-                    # Clamp the bias between -100 and 100 per OpenAI API spec
-                    bias = min(100, max(-100, bias))
-                    logits[int(token_id)] += bias
-                return logits
-
-            logits_processors = [logit_bias_logits_processor]
+            biases = {
+                int(tok): min(100, max(float(bias), -100))
+                for tok, bias in self.logit_bias.items()
+                if 0 < int(tok) < vocab_size
+            }
+            logits_processors.append(BiasLogitsProcessor(biases))
 
         return SamplingParams(
             n=self.n,
@@ -229,22 +231,21 @@ class CompletionRequest(BaseModel):
     guided_json: Optional[Union[str, dict, BaseModel]] = None
     guided_regex: Optional[str] = None
     guided_choice: Optional[List[str]] = None
+    guided_grammar: Optional[str] = None
+    response_format: Optional[ResponseFormat] = None
 
-    def to_sampling_params(self) -> SamplingParams:
+    def to_sampling_params(self, vocab_size: int) -> SamplingParams:
         echo_without_generation = self.echo and self.max_tokens == 0
 
-        logits_processors = None
+        logits_processors = []
         if self.logit_bias:
+            biases = {
+                int(tok): min(100, max(float(bias), -100))
+                for tok, bias in self.logit_bias.items()
+                if 0 < int(tok) < vocab_size
+            }
+            logits_processors.append(BiasLogitsProcessor(biases))
 
-            def logit_bias_logits_processor(
-                    token_ids: List[int],
-                    logits: torch.Tensor) -> torch.Tensor:
-                for token_id, bias in self.logit_bias.items():
-                    bias = min(100, max(-100, bias))
-                    logits[int(token_id)] += bias
-                return logits
-
-            logits_processors = [logit_bias_logits_processor]
         return SamplingParams(
             n=self.n,
             max_tokens=self.max_tokens if not echo_without_generation else 1,
@@ -378,6 +379,37 @@ class ChatCompletionStreamResponse(BaseModel):
     choices: List[ChatCompletionResponseStreamChoice]
     usage: Optional[UsageInfo] = Field(default=None)
     logprobs: Optional[LogProbs] = None
+
+
+class EmbeddingsRequest(BaseModel):
+    input: List[str] = Field(
+        ..., description="List of input texts to generate embeddings for.")
+    encoding_format: str = Field(
+        "float",
+        description="Encoding format for the embeddings. "
+        "Can be 'float' or 'base64'.")
+    model: Optional[str] = Field(
+        None,
+        description="Name of the embedding model to use. "
+        "If not provided, the default model will be used.")
+
+
+class EmbeddingObject(BaseModel):
+    object: str = Field("embedding", description="Type of the object.")
+    embedding: List[float] = Field(
+        ..., description="Embedding values as a list of floats.")
+    index: int = Field(
+        ...,
+        description="Index of the input text corresponding to "
+        "the embedding.")
+
+
+class EmbeddingsResponse(BaseModel):
+    object: str = Field("list", description="Type of the response object.")
+    data: List[EmbeddingObject] = Field(
+        ..., description="List of embedding objects.")
+    model: str = Field(..., description="Name of the embedding model used.")
+    usage: UsageInfo = Field(..., description="Information about token usage.")
 
 
 class Prompt(BaseModel):

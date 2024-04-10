@@ -6,9 +6,9 @@ from typing import Dict, List, Tuple, Set, Optional
 import torch
 import torch.distributed
 
-from aphrodite.common.config import (CacheConfig, ModelConfig, ParallelConfig,
-                                     SchedulerConfig, LoRAConfig, DeviceConfig)
-from aphrodite.common.utils import in_wsl
+from aphrodite.common.config import (CacheConfig, DeviceConfig, ModelConfig,
+                                     ParallelConfig, SchedulerConfig,
+                                     LoRAConfig)
 from aphrodite.modeling import set_random_seed
 from aphrodite.modeling.megatron import cupy_utils
 from aphrodite.modeling.megatron.communication_op import (broadcast_tensor_dict
@@ -20,7 +20,7 @@ from aphrodite.common.sequence import SamplerOutput, SequenceGroupMetadata
 from aphrodite.task_handler.cache_engine import CacheEngine
 from aphrodite.task_handler.model_runner import ModelRunner
 from aphrodite.lora.request import LoRARequest
-from aphrodite.common.utils import is_hip
+from aphrodite.common.utils import in_wsl
 
 
 class Worker:
@@ -42,7 +42,7 @@ class Worker:
         distributed_init_method: str,
         lora_config: Optional[LoRAConfig] = None,
         kv_cache_dtype: Optional[str] = "auto",
-        kv_quant_params_path: Optional[str] = None,
+        # kv_quant_params_path: Optional[str] = None,
         is_driver_worker: bool = False,
     ) -> None:
         self.model_config = model_config
@@ -64,13 +64,12 @@ class Worker:
             device_config,
             lora_config=self.lora_config,
             kv_cache_dtype=kv_cache_dtype,
-            kv_quant_params_path=kv_quant_params_path,
+            # kv_quant_params_path=kv_quant_params_path,
             is_driver_worker=is_driver_worker)
         # Uninitialized cache engine. Will be initialized by
         # self.init_cache_engine().
         self.cache_config = None
         self.cache_engine = None
-        self.cache_events = None
         self.gpu_cache = None
 
     def init_model(self, cupy_port: Optional[int] = None) -> None:
@@ -99,12 +98,9 @@ class Worker:
         else:
             raise RuntimeError(
                 f"Not support device type: {self.device_config.device}")
-
         # Initialize the distributed environment.
         init_distributed_environment(self.parallel_config, self.rank,
                                      cupy_port, self.distributed_init_method)
-        if not self.parallel_config.disable_custom_all_reduce:
-            init_custom_ar()
         # Initialize the model.
         set_random_seed(self.model_config.seed)
 
@@ -143,8 +139,8 @@ class Worker:
         # GPU did not change their memory usage during the profiling.
         peak_memory = self.init_gpu_memory - free_gpu_memory
 
-        cache_block_size = CacheEngine.get_cache_block_size(
-            block_size, cache_dtype, self.model_config, self.parallel_config)
+        cache_block_size = self.get_cache_block_size_bytes(
+            block_size, cache_dtype)
         num_gpu_blocks = int(
             (total_gpu_memory * gpu_memory_utilization - peak_memory) //
             cache_block_size)
@@ -161,7 +157,6 @@ class Worker:
         self.cache_config = cache_config
         self.cache_engine = CacheEngine(self.cache_config, self.model_config,
                                         self.parallel_config)
-        self.cache_events = self.cache_engine.events
         self.gpu_cache = self.cache_engine.gpu_cache
         self.model_runner.set_block_size(self.cache_engine.block_size)
 
@@ -179,24 +174,13 @@ class Worker:
         blocks_to_copy: Dict[int, List[int]],
     ) -> None:
         # Issue cache operations.
-        issued_cache_op = False
+        # TODO: Profile the overhead of swapping operations and optimize
         if blocks_to_swap_in:
             self.cache_engine.swap_in(blocks_to_swap_in)
-            issued_cache_op = True
         if blocks_to_swap_out:
             self.cache_engine.swap_out(blocks_to_swap_out)
-            issued_cache_op = True
         if blocks_to_copy:
             self.cache_engine.copy(blocks_to_copy)
-            issued_cache_op = True
-
-        cache_events = self.cache_events if issued_cache_op else None
-
-        # Wait for cache operations to finish.
-        # TODO: Profile swapping overhead and optimize if needed.
-        if cache_events is not None:
-            for event in cache_events:  # pylint: disable=not-an-iterable
-                event.wait()
 
     @torch.inference_mode()
     def execute_model(
@@ -245,6 +229,22 @@ class Worker:
     def list_loras(self) -> Set[int]:
         return self.model_runner.list_loras()
 
+    @property
+    def max_model_len(self) -> int:
+        return self.model_config.max_model_len
+
+    @property
+    def vocab_size(self) -> int:
+        return self.model_runner.vocab_size
+
+    def get_cache_block_size_bytes(self, block_size: int,
+                                   cache_dtype: str) -> int:
+        """Get the size of the KV cache block size in bytes.
+        """
+        return CacheEngine.get_cache_block_size(block_size, cache_dtype,
+                                                self.model_config,
+                                                self.parallel_config)
+
 
 def init_distributed_environment(
     parallel_config: ParallelConfig,
@@ -279,8 +279,7 @@ def init_distributed_environment(
                 "cupy.distributed is already initialized but the cupy world "
                 "size does not match parallel_config.world_size "
                 f"({cupy_world_size} vs. {parallel_config.world_size}).")
-    elif (parallel_config.world_size > 1 and cupy_port is not None
-          and not is_hip()):
+    elif (parallel_config.world_size > 1 and cupy_port is not None):
         # NOTE: We don't initialize CuPy process group when world size
         # is 1.
         # TODO: Support multi-node connection.
@@ -297,6 +296,10 @@ def init_distributed_environment(
         cupy_utils.all_reduce(torch.zeros(1).cuda())
     ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
                                       parallel_config.pipeline_parallel_size)
+
+    # Initialize a custom fast all-reduce implementation.
+    if not parallel_config.disable_custom_all_reduce:
+        init_custom_ar()
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):

@@ -5,16 +5,21 @@ import subprocess
 import uuid
 import gc
 from platform import uname
-from loguru import logger
+from typing import List, Tuple, Union, Generic
+from packaging.version import parse, Version
 
 import psutil
 import torch
 import asyncio
-from functools import partial
-from typing import (Any, Awaitable, Callable, Hashable, Optional, TypeVar,
-                    List, Tuple, Union)
+from functools import partial, lru_cache
+from typing import (
+    Awaitable,
+    Callable,
+    TypeVar,
+)
 from collections import OrderedDict
-from packaging.version import parse, Version
+from typing import Any, Hashable, Optional
+from loguru import logger
 
 T = TypeVar("T")
 
@@ -23,7 +28,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "bfloat16": torch.bfloat16,
     "float": torch.float,
     "fp8_e5m2": torch.uint8,
-    "int8": torch.int8,
+    # "int8": torch.int8,
 }
 
 
@@ -46,10 +51,10 @@ class Counter:
         self.counter = 0
 
 
-class LRUCache:
+class LRUCache(Generic[T]):
 
     def __init__(self, capacity: int):
-        self.cache = OrderedDict()
+        self.cache = OrderedDict[Hashable, T]()
         self.capacity = capacity
 
     def __contains__(self, key: Hashable) -> bool:
@@ -58,10 +63,10 @@ class LRUCache:
     def __len__(self) -> int:
         return len(self.cache)
 
-    def __getitem__(self, key: Hashable) -> Any:
+    def __getitem__(self, key: Hashable) -> T:
         return self.get(key)
 
-    def __setitem__(self, key: Hashable, value: Any) -> None:
+    def __setitem__(self, key: Hashable, value: T) -> None:
         self.put(key, value)
 
     def __delitem__(self, key: Hashable) -> None:
@@ -70,7 +75,9 @@ class LRUCache:
     def touch(self, key: Hashable) -> None:
         self.cache.move_to_end(key)
 
-    def get(self, key: Hashable, default_value: Optional[Any] = None) -> int:
+    def get(self,
+            key: Hashable,
+            default_value: Optional[T] = None) -> Optional[T]:
         if key in self.cache:
             value = self.cache[key]
             self.cache.move_to_end(key)
@@ -78,12 +85,12 @@ class LRUCache:
             value = default_value
         return value
 
-    def put(self, key: Hashable, value: Any) -> None:
+    def put(self, key: Hashable, value: T) -> None:
         self.cache[key] = value
         self.cache.move_to_end(key)
         self._remove_old_if_needed()
 
-    def _on_remove(self, key: Hashable, value: Any):
+    def _on_remove(self, key: Hashable, value: T):
         pass
 
     def remove_oldest(self):
@@ -96,7 +103,7 @@ class LRUCache:
         while len(self.cache) > self.capacity:
             self.remove_oldest()
 
-    def pop(self, key: int, default_value: Optional[Any] = None) -> Any:
+    def pop(self, key: Hashable, default_value: Optional[Any] = None) -> T:
         run_on_remove = key in self.cache
         value = self.cache.pop(key, default_value)
         if run_on_remove:
@@ -113,12 +120,26 @@ def is_hip() -> bool:
     return torch.version.hip is not None
 
 
+@lru_cache(maxsize=None)
+def is_neuron() -> bool:
+    try:
+        import transformers_neuronx
+    except ImportError:
+        transformers_neuronx = None
+    return transformers_neuronx is not None
+
+
+@lru_cache(maxsize=None)
 def get_max_shared_memory_bytes(gpu: int = 0) -> int:
     """Returns the maximum shared memory per thread block in bytes."""
+    # NOTE: This import statement should be executed lazily since
+    # the Neuron-X backend does not have the `cuda_utils` module.
     from aphrodite._C import cuda_utils
-    # https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html
+
     max_shared_mem = (
         cuda_utils.get_max_shared_memory_per_block_device_attribute(gpu))
+    # value 0 will cause MAX_SEQ_LEN become negative and test_attention.py
+    # will fail
     assert max_shared_mem > 0, "max_shared_mem can not be zero"
     return int(max_shared_mem)
 
@@ -132,6 +153,7 @@ def random_uuid() -> str:
     return str(uuid.uuid4().hex)
 
 
+@lru_cache(maxsize=None)
 def in_wsl() -> bool:
     # Reference: https://github.com/microsoft/WSL/issues/4071
     return "microsoft" in " ".join(uname()).lower()
@@ -139,6 +161,7 @@ def in_wsl() -> bool:
 
 def make_async(func: Callable[..., T]) -> Callable[..., Awaitable[T]]:
     """Take a blocking function, and run it on in an executor thread.
+
     This function prevents the blocking function from blocking the
     asyncio event loop.
     The code in this function needs to be thread safe.
@@ -153,35 +176,58 @@ def make_async(func: Callable[..., T]) -> Callable[..., Awaitable[T]]:
 
 
 def get_ip() -> str:
+    # try ipv4
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
-    return s.getsockname()[0]
+    try:
+        s.connect(("8.8.8.8", 80))  # Doesn't need to be reachable
+        return s.getsockname()[0]
+    except OSError:
+        # try ipv6
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("dns.google", 80))
+        return s.getsockname()[0]
+
+
+def get_distributed_init_method(ip: str, port: int) -> str:
+    return f"tcp://{ip}:{port}"
 
 
 def get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+    # try ipv4
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+    except OSError:
+        # try ipv6
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
 
 
 def set_cuda_visible_devices(device_ids: List[int]) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, device_ids))
 
 
+@lru_cache(maxsize=None)
 def get_nvcc_cuda_version() -> Optional[Version]:
     cuda_home = os.environ.get('CUDA_HOME')
-    nvcc_path = os.path.join(cuda_home, 'bin', 'nvcc') if cuda_home else 'nvcc'
-
-    try:
-        nvcc_output = subprocess.check_output([nvcc_path, "-V"],
-                                              universal_newlines=True)
-        output = nvcc_output.split()
-        release_idx = output.index("release") + 1
-        nvcc_cuda_version = parse(output[release_idx].split(",")[0])
-        return nvcc_cuda_version
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        logger.warning("nvcc not found. Skipping CUDA version check!")
-        return None
+    if not cuda_home:
+        cuda_home = '/usr/local/cuda'
+        if os.path.isfile(cuda_home + '/bin/nvcc'):
+            logger.info(
+                f'CUDA_HOME is not found in the environment. Using {cuda_home} '
+                'as CUDA_HOME.')
+        else:
+            logger.warning(
+                f'Not found nvcc in {cuda_home}. Skip cuda version check!')
+            return None
+    nvcc_output = subprocess.check_output([cuda_home + "/bin/nvcc", "-V"],
+                                          universal_newlines=True)
+    output = nvcc_output.split()
+    release_idx = output.index("release") + 1
+    nvcc_cuda_version = parse(output[release_idx].split(",")[0])
+    return nvcc_cuda_version
 
 
 def _generate_random_fp8_e5m2(
@@ -248,8 +294,8 @@ def create_kv_caches_with_random(
                                 device=device)
         if cache_dtype == 'fp8_e5m2':
             _generate_random_fp8_e5m2(key_cache, -scale, scale)
-        elif cache_dtype == 'int8':
-            torch.randint(-128, 127, key_cache.size(), out=key_cache)
+        # elif cache_dtype == 'int8':
+        #     torch.randint(-128, 127, key_cache.size(), out=key_cache)
         elif torch_dtype in [torch.half, torch.bfloat16, torch.float]:
             key_cache.uniform_(-scale, scale)
         else:
@@ -265,8 +311,8 @@ def create_kv_caches_with_random(
                                   device=device)
         if cache_dtype == 'fp8_e5m2':
             _generate_random_fp8_e5m2(value_cache, -scale, scale)
-        elif cache_dtype == 'int8':
-            torch.randint(-128, 127, value_cache.size(), out=value_cache)
+        # elif cache_dtype == 'int8':
+        #     torch.randint(-128, 127, value_cache.size(), out=value_cache)
         elif torch_dtype in [torch.half, torch.bfloat16, torch.float]:
             value_cache.uniform_(-scale, scale)
         else:

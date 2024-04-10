@@ -62,11 +62,12 @@ class OpenAIServingChat(OpenAIServing):
         try:
             token_ids = self._validate_prompt_and_tokenize(request,
                                                            prompt=prompt)
-            sampling_params = request.to_sampling_params()
+            sampling_params = request.to_sampling_params(
+                self.tokenizer.vocab_size)
             lora_request = self._maybe_get_lora(request)
             guided_decode_logits_processor = (
                 await get_guided_decoding_logits_processor(
-                    request, self.engine.get_tokenizer()))
+                    request, await self.engine.get_tokenizer()))
             if guided_decode_logits_processor:
                 if sampling_params.logits_processors is None:
                     sampling_params.logits_processors = []
