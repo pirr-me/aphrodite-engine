@@ -4,6 +4,7 @@ Internal logging utility.
 
 import logging
 import os
+import sys
 
 from loguru import logger
 from rich.console import Console
