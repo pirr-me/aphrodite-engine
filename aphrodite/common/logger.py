@@ -19,6 +19,9 @@ from rich.progress import (
 
 RICH_CONSOLE = Console()
 LOG_LEVEL = os.getenv("APHRODITE_LOG_LEVEL", "INFO").upper()
+_GCP_LOG_FORMAT = (
+        "{level:<.1}{time:MMDD HH:mm:ss.SSSSSS} {process} {name}:{line}] {message} | {extra}"
+    )
 
 
 def unwrap(wrapped, default=None):
@@ -112,8 +115,8 @@ def setup_logger():
     logger.remove()
 
     logger.add(
-        RICH_CONSOLE.print,
+        sys.stdout,
         level=LOG_LEVEL,
-        format=_log_formatter,
+        format=_GCP_LOG_FORMAT,
         colorize=True,
     )
