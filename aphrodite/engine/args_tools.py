@@ -1,17 +1,15 @@
 import argparse
 import dataclasses
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional
 
-from aphrodite.common.config import (
-    CacheConfig,
-    ModelConfig,
-    ParallelConfig,
-    SchedulerConfig,
-    LoRAConfig,
-    DeviceConfig,
-    TokenizerPoolConfig,
-)
+from aphrodite.common.config import (CacheConfig, DecodingConfig, DeviceConfig,
+                                     EngineConfig, LoadConfig, LoRAConfig,
+                                     ModelConfig, ParallelConfig,
+                                     SchedulerConfig, SpeculativeConfig,
+                                     TokenizerPoolConfig, VisionLanguageConfig)
+from aphrodite.common.utils import str_to_int_tuple
+from aphrodite.quantization import QUANTIZATION_METHODS
 
 
 @dataclass
@@ -20,13 +18,14 @@ class EngineArgs:
 
     model: str
     tokenizer: Optional[str] = None
+    skip_tokenizer_init: bool = False
     tokenizer_mode: str = "auto"
     trust_remote_code: bool = False
     download_dir: Optional[str] = None
     load_format: str = "auto"
     dtype: str = "auto"
     kv_cache_dtype: str = "auto"
-    # kv_quant_params_path: str = None
+    quantization_param_path: Optional[str] = None
     seed: int = 0
     max_model_len: Optional[int] = None
     worker_use_ray: bool = False
@@ -34,12 +33,13 @@ class EngineArgs:
     tensor_parallel_size: int = 1
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
-    context_shift: bool = False
+    enable_prefix_caching: bool = False
+    use_v2_block_manager: bool = False
     swap_space: int = 4  # GiB
     gpu_memory_utilization: float = 0.90
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: int = 256
-    max_log_probs: int = 10  # OpenAI default is 5, setting to 10 because ST
+    max_logprobs: int = 10  # OpenAI default is 5, setting to 10 because ST
     disable_log_stats: bool = False
     revision: Optional[str] = None
     code_revision: Optional[str] = None
@@ -49,7 +49,8 @@ class EngineArgs:
     load_in_8bit: bool = False
     load_in_smooth: bool = False
     enforce_eager: bool = True
-    max_context_len_to_capture: int = 8192
+    max_context_len_to_capture: Optional[int] = None
+    max_seq_len_to_capture: int = 8192
     disable_custom_all_reduce: bool = False
     tokenizer_pool_size: int = 0
     tokenizer_pool_type: str = "ray"
@@ -57,11 +58,29 @@ class EngineArgs:
     enable_lora: bool = False
     max_loras: int = 1
     max_lora_rank: int = 16
+    fully_sharded_loras: bool = False
     lora_extra_vocab_size: int = 256
     lora_dtype = "auto"
     max_cpu_loras: Optional[int] = None
     device: str = "auto"
     ray_workers_use_nsight: bool = False
+    num_gpu_blocks_override: Optional[int] = None
+    num_lookahead_slots: int = 0
+    model_loader_extra_config: Optional[dict] = None
+    # Related to Vision-language models such as llava
+    image_input_type: Optional[str] = None
+    image_token_id: Optional[int] = None
+    image_input_shape: Optional[str] = None
+    image_feature_size: Optional[int] = None
+    scheduler_delay_factor: float = 0.0
+    enable_chunked_prefill: bool = False
+    guided_decoding_backend: str = 'outlines'
+    # Speculative decoding config
+    speculative_model: Optional[str] = None
+    num_speculative_tokens: Optional[int] = None
+    speculative_max_model_len: Optional[int] = None
+    ngram_prompt_lookup_max: Optional[int] = None
+    ngram_prompt_lookup_min: Optional[int] = None
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -88,6 +107,10 @@ class EngineArgs:
             default=EngineArgs.tokenizer,
             help="name or path of the huggingface tokenizer to use",
         )
+        parser.add_argument(
+            "--skip-tokenizer-init",
+            action="store_true",
+            help="Skip initialization of tokenizer and detokenizer")
         parser.add_argument(
             "--revision",
             type=str,
@@ -135,51 +158,60 @@ class EngineArgs:
             "huggingface",
         )
         parser.add_argument(
-            "--load-format",
+            '--load-format',
             type=str,
             default=EngineArgs.load_format,
-            choices=["auto", "pt", "safetensors", "npcache", "dummy"],
-            help="The format of the model weights to load. "
-            '"auto" will try to load the weights in the safetensors format '
-            "and fall back to the pytorch bin format if safetensors format "
-            "is not available. "
-            '"pt" will load the weights in the pytorch bin format. '
-            '"safetensors" will load the weights in the safetensors format. '
-            '"npcache" will load the weights in pytorch format and store '
-            "a numpy cache to speed up the loading. "
-            '"dummy" will initialize the weights with random values, '
-            "which is mainly for profiling.",
-        )
+            choices=[
+                'auto', 'pt', 'safetensors', 'npcache', 'dummy', 'tensorizer'
+            ],
+            help='The format of the model weights to load.\n\n'
+            '* "auto" will try to load the weights in the safetensors format '
+            'and fall back to the pytorch bin format if safetensors format '
+            'is not available.\n'
+            '* "pt" will load the weights in the pytorch bin format.\n'
+            '* "safetensors" will load the weights in the safetensors format.\n'
+            '* "npcache" will load the weights in pytorch format and store '
+            'a numpy cache to speed up the loading.\n'
+            '* "dummy" will initialize the weights with random values, '
+            'which is mainly for profiling.\n'
+            '* "tensorizer" will load the weights using tensorizer from '
+            'CoreWeave which assumes tensorizer_uri is set to the location of '
+            'the serialized weights.')
         parser.add_argument(
-            "--dtype",
+            '--dtype',
             type=str,
             default=EngineArgs.dtype,
             choices=[
-                "auto", "half", "float16", "bfloat16", "float", "float32"
+                'auto', 'half', 'float16', 'bfloat16', 'float', 'float32'
             ],
-            help="data type for model weights and activations. "
-            'The "auto" option will use FP16 precision '
-            "for FP32 and FP16 models, and BF16 precision "
-            "for BF16 models.",
-        )
+            help='Data type for model weights and activations.\n\n'
+            '* "auto" will use FP16 precision for FP32 and FP16 models, and '
+            'BF16 precision for BF16 models.\n'
+            '* "half" for FP16. Recommended for AWQ quantization.\n'
+            '* "float16" is the same as "half".\n'
+            '* "bfloat16" for a balance between precision and range.\n'
+            '* "float" is shorthand for FP32 precision.\n'
+            '* "float32" for FP32 precision.')
         parser.add_argument(
-            "--kv-cache-dtype",
+            '--kv-cache-dtype',
             type=str,
-            # choices=["auto", "fp8_e5m2", "int8"],
-            choices=['auto', 'fp8_e5m2'],
+            choices=['auto', 'fp8'],
             default=EngineArgs.kv_cache_dtype,
             help='Data type for kv cache storage. If "auto", will use model '
-            "data type. Note FP8 is not supported when cuda version is "
-            "lower than 11.8.",
-        )
-        # parser.add_argument(
-        #     "--kv-quant-params-path",
-        #     type=str,
-        #     default=EngineArgs.kv_quant_params_path,
-        #     help="Path to scales and zero points of KV cache "
-        #     "quantization. Only applicable when kv-cache-dtype "
-        #     "is int8.",
-        # )
+            'data type. FP8_E5M2 (without scaling) is only supported on cuda '
+            'version greater than 11.8. On ROCm (AMD GPU), FP8_E4M3 is instead '
+            'supported for common inference criteria. ')
+        parser.add_argument(
+            '--quantization-param-path',
+            type=str,
+            default=None,
+            help='Path to the JSON file containing the KV cache '
+            'scaling factors. This should generally be supplied, when '
+            'KV cache dtype is FP8. Otherwise, KV cache scaling factors '
+            'default to 1.0, which may cause accuracy issues. '
+            'FP8_E5M2 (without scaling) is only supported on cuda version'
+            'greater than 11.8. On ROCm (AMD GPU), FP8_E4M3 is instead '
+            'supported for common inference criteria. ')
         parser.add_argument(
             "--max-model-len",
             type=int,
@@ -187,6 +219,17 @@ class EngineArgs:
             help="model context length. If unspecified, "
             "will be automatically derived from the model.",
         )
+        parser.add_argument(
+            '--guided-decoding-backend',
+            type=str,
+            default='outlines',
+            choices=['outlines', 'lm-format-enforcer'],
+            help='Which engine will be used for guided decoding'
+            ' (JSON schema / regex etc) by default. Currently support '
+            'https://github.com/outlines-dev/outlines and '
+            'https://github.com/noamgat/lm-format-enforcer.'
+            ' Can be overridden per request via guided_decoding_backend'
+            ' parameter.')
         # Parallel arguments
         parser.add_argument(
             "--worker-use-ray",
@@ -199,15 +242,14 @@ class EngineArgs:
             "-pp",
             type=int,
             default=EngineArgs.pipeline_parallel_size,
-            help="number of pipeline stages",
-        )
+            help="number of pipeline stages. Currently not supported.")
         parser.add_argument(
             "--tensor-parallel-size",
             "-tp",
             type=int,
             default=EngineArgs.tensor_parallel_size,
-            help="number of tensor parallel replicas",
-        )
+            help="number of tensor parallel replicas, i.e. the number of GPUs "
+            "to use.")
         parser.add_argument(
             "--max-parallel-loading-workers",
             type=int,
@@ -226,14 +268,26 @@ class EngineArgs:
             "--block-size",
             type=int,
             default=EngineArgs.block_size,
-            choices=[8, 16, 32, 128],
+            choices=[8, 16, 32],
             help="token block size",
         )
         parser.add_argument(
+            "--enable-prefix-caching",
             "--context-shift",
             action="store_true",
             help="Enable context shifting.",
         )
+        parser.add_argument("--use-v2-block-manager",
+                            action="store_true",
+                            help="Use the v2 block manager.")
+        parser.add_argument(
+            "--num-lookahead-slots",
+            type=int,
+            default=EngineArgs.num_lookahead_slots,
+            help="Experimental scheduling config necessary for "
+            "speculative decoding. This will be replaced by "
+            "speculative decoding config in the future; it is "
+            "present for testing purposes until then.")
         parser.add_argument("--seed",
                             type=int,
                             default=EngineArgs.seed,
@@ -254,6 +308,12 @@ class EngineArgs:
             "If unspecified, will use the default value of 0.9.",
         )
         parser.add_argument(
+            "--num-gpu-blocks-override",
+            type=int,
+            default=None,
+            help="If specified, ignore GPU profiling result and use this "
+            "number of GPU blocks. Used for testing preemption.")
+        parser.add_argument(
             "--max-num-batched-tokens",
             type=int,
             default=EngineArgs.max_num_batched_tokens,
@@ -267,9 +327,9 @@ class EngineArgs:
             help="maximum number of sequences per iteration",
         )
         parser.add_argument(
-            "--max-log-probs",
+            "--max-logprobs",
             type=int,
-            default=EngineArgs.max_log_probs,
+            default=EngineArgs.max_logprobs,
             help="maximum number of log probabilities to "
             "return.",
         )
@@ -283,18 +343,7 @@ class EngineArgs:
             "--quantization",
             "-q",
             type=str,
-            choices=[
-                "aqlm",
-                "awq",
-                "bnb",
-                "exl2",
-                "gguf",
-                "gptq",
-                "quip",
-                "squeezellm",
-                "marlin",
-                None,
-            ],
+            choices=[*QUANTIZATION_METHODS, None],
             default=EngineArgs.quantization,
             help="Method used to quantize the weights. If "
             "None, we first check the `quantization_config` "
@@ -330,14 +379,20 @@ class EngineArgs:
             "will use eager mode and CUDA graph in hybrid "
             "for maximal performance and flexibility.",
         )
-        parser.add_argument(
-            "--max-context-len-to-capture",
-            type=int,
-            default=EngineArgs.max_context_len_to_capture,
-            help="maximum context length covered by CUDA "
-            "graphs. When a sequence has context length "
-            "larger than this, we fall back to eager mode.",
-        )
+        parser.add_argument('--max-context-len-to-capture',
+                            type=int,
+                            default=EngineArgs.max_context_len_to_capture,
+                            help='Maximum context length covered by CUDA '
+                            'graphs. When a sequence has context length '
+                            'larger than this, we fall back to eager mode. '
+                            '(DEPRECATED. Use --max-seq_len-to-capture instead'
+                            ')')
+        parser.add_argument('--max-seq_len-to-capture',
+                            type=int,
+                            default=EngineArgs.max_seq_len_to_capture,
+                            help='Maximum sequence length covered by CUDA '
+                            'graphs. When a sequence has context length '
+                            'larger than this, we fall back to eager mode.')
         parser.add_argument(
             "--disable-custom-all-reduce",
             action="store_true",
@@ -406,13 +461,98 @@ class EngineArgs:
                   "Defaults to max_num_seqs."),
         )
         parser.add_argument(
+            "--fully-sharded-loras",
+            action='store_true',
+            help=("By default, only half of the LoRA computation is sharded "
+                  "with tensor parallelism. Enabling this will use the fully "
+                  "sharded layers. At high sequence length, max rank or "
+                  "tensor parallel size, this is likely faster."))
+        parser.add_argument(
             "--device",
             type=str,
             default=EngineArgs.device,
-            choices=["cuda"],
-            help=("Device to use for model execution. "
-                  'Currently, only "cuda" is supported.'),
+            choices=["auto", "cuda", "neuron", "cpu"],
+            help=("Device to use for model execution."),
         )
+        # Related to Vision-language models such as llava
+        parser.add_argument(
+            "--image-input-type",
+            type=str,
+            default=None,
+            choices=[
+                t.name.lower() for t in VisionLanguageConfig.ImageInputType
+            ],
+            help=("The image input type passed into Aphrodite. "
+                  "Should be one of `pixel_values` or `image_features`"))
+        parser.add_argument("--image-token-id",
+                            type=int,
+                            default=None,
+                            help=("Input id for image token."))
+        parser.add_argument(
+            '--image-input-shape',
+            type=str,
+            default=None,
+            help=(
+                'The biggest image input shape (worst for memory footprint) '
+                'given an input type. Only used for Aphrodite\'s profile_run.'
+            ))
+        parser.add_argument(
+            '--image-feature-size',
+            type=int,
+            default=None,
+            help=('The image feature size along the context dimension.'))
+        parser.add_argument(
+            "--scheduler-delay-factor",
+            "-sdf",
+            type=float,
+            default=EngineArgs.scheduler_delay_factor,
+            help="Apply a delay (of delay factor multiplied by previous "
+            "prompt latency) before scheduling next prompt.")
+        parser.add_argument(
+            "--enable-chunked-prefill",
+            action="store_true",
+            help="If True, the prefill requests can be chunked based on the "
+            "max_num_batched_tokens.")
+        parser.add_argument(
+            "--speculative-model",
+            type=str,
+            default=EngineArgs.speculative_model,
+            help=
+            "The name of the draft model to be used in speculative decoding.")
+        parser.add_argument(
+            "--num-speculative-tokens",
+            type=int,
+            default=EngineArgs.num_speculative_tokens,
+            help="The number of speculative tokens to sample from "
+            "the draft model in speculative decoding")
+        parser.add_argument(
+            "--speculative-max-model-len",
+            type=str,
+            default=EngineArgs.speculative_max_model_len,
+            help="The maximum sequence length supported by the "
+            "draft model. Sequences over this length will skip "
+            "speculation.")
+        parser.add_argument(
+            "--ngram-prompt-lookup-max",
+            type=int,
+            default=EngineArgs.ngram_prompt_lookup_max,
+            help="Max size of window for ngram prompt lookup in speculative "
+            "decoding.")
+        parser.add_argument(
+            "--ngram-prompt-lookup-min",
+            type=int,
+            default=EngineArgs.ngram_prompt_lookup_min,
+            help="Min size of window for ngram prompt lookup in speculative "
+            "decoding.")
+        parser.add_argument("--model-loader-extra-config",
+                            type=str,
+                            default=EngineArgs.model_loader_extra_config,
+                            help="Extra config for model loader. "
+                            "This will be passed to the model loader "
+                            "corresponding to the chosen load_format. "
+                            "This should be a JSON string that will be "
+                            "parsed into a dictionary.")
+
         return parser
 
     @classmethod
@@ -423,18 +563,13 @@ class EngineArgs:
         engine_args = cls(**{attr: getattr(args, attr) for attr in attrs})
         return engine_args
 
-    def create_engine_configs(
-        self,
-    ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
-               DeviceConfig, Optional[LoRAConfig], ]:
+    def create_engine_config(self, ) -> EngineConfig:
         device_config = DeviceConfig(self.device)
         model_config = ModelConfig(
             self.model,
             self.tokenizer,
             self.tokenizer_mode,
             self.trust_remote_code,
-            self.download_dir,
-            self.load_format,
             self.dtype,
             self.seed,
             self.revision,
@@ -445,19 +580,25 @@ class EngineArgs:
             self.load_in_4bit,
             self.load_in_8bit,
             self.load_in_smooth,
+            self.quantization_param_path,
             self.enforce_eager,
             self.max_context_len_to_capture,
-            self.max_log_probs,
+            self.max_seq_len_to_capture,
+            self.max_logprobs,
+            self.skip_tokenizer_init,
         )
+
         cache_config = CacheConfig(
             self.block_size,
             self.gpu_memory_utilization,
             self.swap_space,
             self.kv_cache_dtype,
             # self.kv_quant_params_path,
+            self.num_gpu_blocks_override,
             model_config.get_sliding_window(),
-            self.context_shift,
+            self.enable_prefix_caching,
         )
+
         parallel_config = ParallelConfig(
             self.pipeline_parallel_size,
             self.tensor_parallel_size,
@@ -471,27 +612,76 @@ class EngineArgs:
             ),
             self.ray_workers_use_nsight,
         )
+
+        speculative_config = SpeculativeConfig.maybe_create_spec_config(
+            target_model_config=model_config,
+            target_parallel_config=parallel_config,
+            target_dtype=self.dtype,
+            speculative_model=self.speculative_model,
+            num_speculative_tokens=self.num_speculative_tokens,
+            speculative_max_model_len=self.speculative_max_model_len,
+            enable_chunked_prefill=self.enable_chunked_prefill,
+            use_v2_block_manager=self.use_v2_block_manager,
+            ngram_prompt_lookup_max=self.ngram_prompt_lookup_max,
+            ngram_prompt_lookup_min=self.ngram_prompt_lookup_min,
+        )
+
         scheduler_config = SchedulerConfig(
             self.max_num_batched_tokens,
             self.max_num_seqs,
             model_config.max_model_len,
+            self.use_v2_block_manager,
+            num_lookahead_slots=(self.num_lookahead_slots
+                                 if speculative_config is None else
+                                 speculative_config.num_lookahead_slots),
+            delay_factor=self.scheduler_delay_factor,
+            enable_chunked_prefill=self.enable_chunked_prefill,
         )
-        lora_config = (LoRAConfig(
+
+        lora_config = LoRAConfig(
             max_lora_rank=self.max_lora_rank,
             max_loras=self.max_loras,
+            fully_sharded_loras=self.fully_sharded_loras,
             lora_extra_vocab_size=self.lora_extra_vocab_size,
             lora_dtype=self.lora_dtype,
-            max_cpu_loras=self.max_cpu_loras
-            if self.max_cpu_loras and self.max_cpu_loras > 0 else None,
-        ) if self.enable_lora else None)
-        return (
-            model_config,
-            cache_config,
-            parallel_config,
-            scheduler_config,
-            device_config,
-            lora_config,
+            max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
+            and self.max_cpu_loras > 0 else None) if self.enable_lora else None
+
+        load_config = LoadConfig(
+            load_format=self.load_format,
+            download_dir=self.download_dir,
+            model_loader_extra_config=self.model_loader_extra_config,
         )
+
+        if self.image_input_type:
+            if (not self.image_token_id or not self.image_input_shape
+                    or not self.image_feature_size):
+                raise ValueError(
+                    "Specify `image_token_id`, `image_input_shape` and "
+                    "`image_feature_size` together with `image_input_type`.")
+            vision_language_config = VisionLanguageConfig(
+                image_input_type=VisionLanguageConfig.
+                get_image_input_enum_type(self.image_input_type),
+                image_token_id=self.image_token_id,
+                image_input_shape=str_to_int_tuple(self.image_input_shape),
+                image_feature_size=self.image_feature_size,
+            )
+        else:
+            vision_language_config = None
+
+        decoding_config = DecodingConfig(
+            guided_decoding_backend=self.guided_decoding_backend)
+
+        return EngineConfig(model_config=model_config,
+                            cache_config=cache_config,
+                            parallel_config=parallel_config,
+                            scheduler_config=scheduler_config,
+                            device_config=device_config,
+                            lora_config=lora_config,
+                            vision_language_config=vision_language_config,
+                            speculative_config=speculative_config,
+                            load_config=load_config,
+                            decoding_config=decoding_config)
 
 
 @dataclass
@@ -501,6 +691,7 @@ class AsyncEngineArgs(EngineArgs):
     engine_use_ray: bool = False
     disable_log_requests: bool = False
     max_log_len: int = 0
+    uvloop: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -524,5 +715,12 @@ class AsyncEngineArgs(EngineArgs):
             help="max number of prompt characters or prompt "
             "ID numbers being printed in log. "
             "Default: unlimited.",
+        )
+        parser.add_argument(
+            "--uvloop",
+            action="store_true",
+            default=EngineArgs.ngram_prompt_lookup_min,
+            help="Use the Uvloop asyncio event loop to possibly increase "
+            "performance"
         )
         return parser

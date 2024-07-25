@@ -6,7 +6,7 @@ from transformers import PreTrainedTokenizer
 
 from aphrodite.common.config import TokenizerPoolConfig
 from aphrodite.lora.request import LoRARequest
-from aphrodite.engine.ray_tools import ray
+from aphrodite.executor.ray_utils import ray
 from aphrodite.transformers_utils.tokenizer_group.base_tokenizer_group import (
     BaseTokenizerGroup)
 from aphrodite.transformers_utils.tokenizer_group.tokenizer_group import (
@@ -51,6 +51,7 @@ class RayTokenizerGroupPool(BaseTokenizerGroup):
             enable_lora=enable_lora,
             max_num_seqs=max_num_seqs,
             max_input_length=max_input_length,
+            **tokenizer_config,
         )
 
         ray_tokenizer_group_cls = ray.remote(

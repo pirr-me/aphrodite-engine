@@ -22,6 +22,11 @@ RUN git clone -b rc_054 https://github.com/pirr-me/aphrodite-engine.git /tmp/aph
     && rm -fr /tmp/aphrodite-engine \
     && chmod +x docker/entrypoint.sh
 
+# Allow build servers to limit ninja build jobs. For reference
+# see https://github.com/PygmalionAI/aphrodite-engine/wiki/1.-Installation#build-from-source
+ARG MAX_JOBS
+ENV MAX_JOBS=${MAX_JOBS}
+
 # Export the CUDA_HOME variable correctly
 ENV CUDA_HOME=/usr/local/cuda
 
@@ -29,6 +34,10 @@ ENV HF_HOME=/tmp
 ENV NUMBA_CACHE_DIR=$HF_HOME/numba_cache
 ENV TORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
 RUN python3 -m pip install --no-cache-dir -e .
+
+# Workaround to properly install flash-attn. For reference
+# see: https://github.com/Dao-AILab/flash-attention/issues/453
+RUN python3 -m pip install 'flash-attn>=2.5.8' --no-build-isolation
 
 # Entrypoint exec form doesn't do variable substitution automatically ($HOME)
 ENTRYPOINT ["/app/aphrodite-engine/docker/entrypoint.sh"]

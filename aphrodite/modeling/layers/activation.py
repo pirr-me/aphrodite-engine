@@ -7,11 +7,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from aphrodite._C import ops
-from aphrodite.modeling.layers.quantization import QuantizationConfig
-from aphrodite.modeling.megatron.parallel_state import (
-    get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
-from aphrodite.modeling.megatron.utils import divide
+from aphrodite.distributed import (divide, get_tensor_model_parallel_rank,
+                                   get_tensor_model_parallel_world_size)
 from aphrodite.modeling.utils import set_weight_attrs
+from aphrodite.quantization import QuantizationConfig
 
 
 class SiluAndMul(nn.Module):
@@ -20,8 +19,8 @@ class SiluAndMul(nn.Module):
     The function computes x -> silu(x[:d]) * x[d:] where d = x.shape[-1] // 2.
 
     Shapes:
-        x: (batch_size, seq_len, 2 * d) or (num_tokens, 2 * d)
-        return: (batch_size, seq_len, d) or (num_tokens, d)
+        x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
+        return: (num_tokens, d) or (batch_size, seq_len, d)
     """
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -39,7 +38,9 @@ class SiluAndMul(nn.Module):
 
 class GeluAndMul(nn.Module):
     """An activation function for GeGLU.
+
     The function computes x -> GELU(x[:d]) * x[d:] where d = x.shape[-1] // 2.
+
     Shapes:
         x: (batch_size, seq_len, 2 * d) or (num_tokens, 2 * d)
         return: (batch_size, seq_len, d) or (num_tokens, d)
@@ -49,7 +50,7 @@ class GeluAndMul(nn.Module):
         super().__init__()
         self.approximate = approximate
         if approximate not in ("none", "tanh"):
-            raise ValueError(f"Invalid approximate value: {approximate}")
+            raise ValueError(f"Unknown approximate mode: {approximate}")
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         """PyTorch-native implementation equivalent to forward()."""
@@ -65,6 +66,9 @@ class GeluAndMul(nn.Module):
         elif self.approximate == "tanh":
             ops.gelu_tanh_and_mul(out, x)
         return out
+
+    def extra_repr(self) -> str:
+        return f'approximate={repr(self.approximate)}'
 
 
 class NewGELU(nn.Module):

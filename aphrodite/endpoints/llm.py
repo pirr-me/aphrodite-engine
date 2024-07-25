@@ -1,5 +1,6 @@
 from typing import List, Optional, Union
 
+import torch
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
@@ -8,6 +9,7 @@ from aphrodite.engine.args_tools import EngineArgs
 from aphrodite.engine.aphrodite_engine import AphroditeEngine
 from aphrodite.common.outputs import RequestOutput
 from aphrodite.common.sampling_params import SamplingParams
+from aphrodite.common.sequence import MultiModalData
 from aphrodite.common.utils import Counter
 
 
@@ -61,6 +63,9 @@ class LLM:
             If False, we will use CUDA graph and eager execution in hybrid.
         max_context_len_to_capture: Maximum context len covered by CUDA graphs.
             When a sequence has context length larger than this, we fall back
+            to eager mode (DEPRECATED. Use `max_seq_len_to_capture` instead).
+        max_seq_len_to_capture: Maximum sequence len covered by CUDA graphs.
+            When a sequence has context length larger than this, we fall back
             to eager mode.
         disable_custom_all_reduce: See ParallelConfig.
     """
@@ -79,7 +84,8 @@ class LLM:
         gpu_memory_utilization: float = 0.9,
         swap_space: int = 4,
         enforce_eager: bool = True,
-        max_context_len_to_capture: int = 8192,
+        max_context_len_to_capture: Optional[int] = None,
+        max_seq_len_to_capture: int = 8192,
         disable_custom_all_reduce: bool = False,
         **kwargs,
     ) -> None:
@@ -99,6 +105,7 @@ class LLM:
             swap_space=swap_space,
             enforce_eager=enforce_eager,
             max_context_len_to_capture=max_context_len_to_capture,
+            max_seq_len_to_capture=max_seq_len_to_capture,
             disable_custom_all_reduce=disable_custom_all_reduce,
             **kwargs,
         )
@@ -118,10 +125,12 @@ class LLM:
     def generate(
         self,
         prompts: Optional[Union[str, List[str]]] = None,
-        sampling_params: Optional[SamplingParams] = None,
+        sampling_params: Optional[Union[SamplingParams,
+                                        List[SamplingParams]]] = None,
         prompt_token_ids: Optional[List[List[int]]] = None,
         use_tqdm: bool = True,
         lora_request: Optional[LoRARequest] = None,
+        multi_modal_data: Optional[MultiModalData] = None,
     ) -> List[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -133,10 +142,14 @@ class LLM:
             prompts: A list of prompts to generate completions for.
             sampling_params: The sampling parameters for text generation. If
                 None, we use the default sampling parameters.
+                When it's a single value, it's applied to every prompt.
+                When it's a list, the list must have the same length as
+                the prompts and it's paired one-to-one with the prompts.
             prompt_token_ids: A list of token IDs for the prompts. If None, we
                 use the tokenizer to convert the prompts to token IDs.
             use_tqdm: Whether to use tqdm to display the progress bar.
             lora_request: LoRA request to use for generation, if any.
+            multi_modal_data: Multi-modal data to use for generation, if any.
 
         Returns:
             A list of `RequestOutput` objects containing the generated
@@ -153,9 +166,23 @@ class LLM:
             raise ValueError(
                 "The lengths of prompts and prompt_token_ids must "
                 "be the same.")
+
+        if prompts is not None:
+            num_requests = len(prompts)
+        else:
+            assert prompt_token_ids is not None
+            num_requests = len(prompt_token_ids)
+
         if sampling_params is None:
             # Use default sampling params.
             sampling_params = SamplingParams()
+        elif isinstance(sampling_params,
+                        list) and len(sampling_params) != num_requests:
+            raise ValueError("The lengths of prompts and sampling_params must "
+                             "be the same.")
+
+        if multi_modal_data:
+            multi_modal_data.data = multi_modal_data.data.to(torch.float16)
 
         # Add requests to the engine.
         num_requests = len(prompts) if prompts is not None else len(
@@ -164,10 +191,18 @@ class LLM:
             prompt = prompts[i] if prompts is not None else None
             token_ids = None if prompt_token_ids is None else prompt_token_ids[
                 i]
-            self._add_request(prompt,
-                              sampling_params,
-                              token_ids,
-                              lora_request=lora_request)
+            self._add_request(
+                prompt,
+                sampling_params[i]
+                if isinstance(sampling_params, list) else sampling_params,
+                token_ids,
+                lora_request=lora_request,
+                # Get ith image while maintaining the batch dim.
+                multi_modal_data=MultiModalData(
+                    type=multi_modal_data.type,
+                    data=multi_modal_data.data[i].unsqueeze(0))
+                if multi_modal_data else None,
+            )
         return self._run_engine(use_tqdm)
 
     def _add_request(
@@ -176,13 +211,15 @@ class LLM:
         sampling_params: SamplingParams,
         prompt_token_ids: Optional[List[int]],
         lora_request: Optional[LoRARequest] = None,
+        multi_modal_data: Optional[MultiModalData] = None,
     ) -> None:
         request_id = str(next(self.request_counter))
         self.llm_engine.add_request(request_id,
                                     prompt,
                                     sampling_params,
                                     prompt_token_ids,
-                                    lora_request=lora_request)
+                                    lora_request=lora_request,
+                                    multi_modal_data=multi_modal_data)
 
     def _run_engine(self, use_tqdm: bool) -> List[RequestOutput]:
         # Initialize tqdm.

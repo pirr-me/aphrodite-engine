@@ -1,109 +1,115 @@
-import importlib
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from loguru import logger
 
-from aphrodite.lora.request import LoRARequest
-from aphrodite.common.config import (
-    CacheConfig,
-    DeviceConfig,
-    ModelConfig,
-    ParallelConfig,
-    SchedulerConfig,
-    LoRAConfig,
-)
+from aphrodite.common.sequence import ExecuteModelRequest, SamplerOutput
+from aphrodite.common.utils import (get_distributed_init_method, get_ip,
+                                    get_open_port, make_async)
 from aphrodite.executor.executor_base import ExecutorAsyncBase, ExecutorBase
-from aphrodite.executor.utils import check_block_size_valid
-from aphrodite.common.sequence import SamplerOutput, SequenceGroupMetadata
-from aphrodite.common.utils import (
-    get_ip,
-    get_open_port,
-    get_distributed_init_method,
-    make_async,
-)
-
-# A map between the device type (in device config) to its worker module.
-DEVICE_TO_WORKER_MODULE_MAP = {
-    "cuda": "aphrodite.task_handler.worker",
-    "neuron": "aphrodite.task_handler.neuron_worker",
-}
+from aphrodite.lora.request import LoRARequest
+from aphrodite.task_handler.worker_base import WorkerWrapperBase
 
 
 class GPUExecutor(ExecutorBase):
 
-    def __init__(
-        self,
-        model_config: ModelConfig,
-        cache_config: CacheConfig,
-        parallel_config: ParallelConfig,
-        scheduler_config: SchedulerConfig,
-        device_config: DeviceConfig,
-        lora_config: Optional[LoRAConfig],
-    ) -> None:
-        self.model_config = model_config
-        self.cache_config = cache_config
-        self.lora_config = lora_config
-        self.parallel_config = parallel_config
-        self.scheduler_config = scheduler_config
-        self.device_config = device_config
+    def _init_executor(self) -> None:
+        """Initialize the worker and load the model.
 
-        # Instantiate the worker and load the model to GPU.
-        self._init_worker()
+        If speculative decoding is enabled, we instead create the speculative
+        worker.
+        """
+        if self.speculative_config is None:
+            self._init_non_spec_worker()
+        else:
+            self._init_spec_worker()
 
-        # Profile the memory usage and initialize the cache.
-        self._init_cache()
-
-    def _dispatch_worker(self):
-        worker_module = DEVICE_TO_WORKER_MODULE_MAP[
-            self.device_config.device_type]
-        imported_worker = importlib.import_module(worker_module)
-        Worker = imported_worker.Worker
-        return Worker
-
-    def _init_worker(self):
-        # Lazy import the Worker to avoid importing torch.cuda/xformers
-        # before CUDA_VISIBLE_DEVICES is set in the Worker
-        Worker = self._dispatch_worker()
-
-        assert (self.parallel_config.world_size == 1
-                ), "GPUExecutor only supports single GPU."
-
-        distributed_init_method = get_distributed_init_method(
-            get_ip(), get_open_port())
-        self.driver_worker = Worker(
-            self.model_config,
-            self.parallel_config,
-            self.scheduler_config,
-            self.device_config,
-            local_rank=0,
-            rank=0,
+    def _get_worker_kwargs(
+            self,
+            local_rank: int = 0,
+            rank: int = 0,
+            distributed_init_method: Optional[str] = None) -> Dict[str, Any]:
+        """Return worker init args for a given rank."""
+        if distributed_init_method is None:
+            distributed_init_method = get_distributed_init_method(
+                get_ip(), get_open_port())
+        return dict(
+            model_config=self.model_config,
+            parallel_config=self.parallel_config,
+            scheduler_config=self.scheduler_config,
+            device_config=self.device_config,
+            cache_config=self.cache_config,
+            load_config=self.load_config,
+            local_rank=local_rank,
+            rank=rank,
             distributed_init_method=distributed_init_method,
             lora_config=self.lora_config,
-            kv_cache_dtype=self.cache_config.cache_dtype,
-            is_driver_worker=True,
+            vision_language_config=self.vision_language_config,
+            is_driver_worker=rank == 0,
         )
-        self.driver_worker.init_model()
+
+    def _create_worker(self,
+                       local_rank: int = 0,
+                       rank: int = 0,
+                       distributed_init_method: Optional[str] = None):
+        wrapper = WorkerWrapperBase(
+            worker_module_name="aphrodite.task_handler.worker",
+            worker_class_name="Worker",
+        )
+        wrapper.init_worker(**self._get_worker_kwargs(local_rank, rank,
+                                                      distributed_init_method))
+        return wrapper.worker
+
+    def _init_non_spec_worker(self):
+        assert self.parallel_config.world_size == 1, (
+            "GPUExecutor only supports single GPU.")
+
+        self.driver_worker = self._create_worker()
+        self.driver_worker.init_device()
         self.driver_worker.load_model()
 
-    def _init_cache(self) -> None:
-        """Profiles the memory usage and initializes the KV cache.
-        The engine first profiles the existing memory usage.
-        Then, it allocates the remaining memory for KV blocks.
-        .. tip::
-            You may limit the usage of GPU memory
-            by adjusting the `gpu_memory_utilization` parameter.
+    def _init_spec_worker(self):
+        """Initialize a SpecDecodeWorker, using a draft model for proposals.
         """
-        # Get the maximum number of blocks that can be allocated on GPU and CPU.
-        (
-            num_gpu_blocks,
-            num_cpu_blocks,
-        ) = self.driver_worker.profile_num_available_blocks(
-            block_size=self.cache_config.block_size,
-            gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
-            cpu_swap_space=self.cache_config.swap_space_bytes,
-            cache_dtype=self.cache_config.cache_dtype,
+        assert self.speculative_config is not None
+
+        from aphrodite.spec_decode.spec_decode_worker import SpecDecodeWorker
+
+        target_worker = self._create_worker()
+
+        draft_worker_kwargs = self._get_worker_kwargs()
+        # Override draft-model specific worker args.
+        draft_worker_kwargs.update(
+            model_config=self.speculative_config.draft_model_config,
+            parallel_config=self.speculative_config.draft_parallel_config,
+            # TODO allow draft-model specific load config.
+            #load_config=self.load_config,
         )
 
+        spec_decode_worker = SpecDecodeWorker.create_worker(
+            scorer_worker=target_worker,
+            draft_worker_kwargs=draft_worker_kwargs,
+        )
+
+        assert self.parallel_config.world_size == 1, (
+            "GPUExecutor only supports single GPU.")
+
+        self.driver_worker = spec_decode_worker
+
+        # Load model handled in spec decode worker.
+        self.driver_worker.init_device()
+
+    def determine_num_available_blocks(self) -> Tuple[int, int]:
+        """Determine the number of available KV blocks by invoking the
+        underlying worker.
+        """
+        return self.driver_worker.determine_num_available_blocks()
+
+    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks) -> None:
+        """Initialize the KV cache by invoking the underlying worker.
+        """
+        # NOTE: This is logged in the executor because there can be >1 worker
+        # with other executors. We could log in the engine level, but work
+        # remains to abstract away the device for non-GPU configurations.
         logger.info(f"# GPU blocks: {num_gpu_blocks}, "
                     f"# CPU blocks: {num_cpu_blocks}")
 
@@ -111,34 +117,12 @@ class GPUExecutor(ExecutorBase):
             f"Minimum concurrency: {num_gpu_blocks * self.cache_config.block_size / self.scheduler_config.max_model_len:.2f}x"  # noqa: E501
         )
 
-        check_block_size_valid(
-            num_gpu_blocks,
-            self.cache_config.block_size,
-            self.model_config.max_model_len,
-        )
-
-        self.cache_config.num_gpu_blocks = num_gpu_blocks
-        self.cache_config.num_cpu_blocks = num_cpu_blocks
-
-        # Initialize the cache.
-        self.driver_worker.init_cache_engine(cache_config=self.cache_config)
-        # Warm up the model. This includes capturing the model into CUDA graph
-        # if enforce_eager is False.
-        self.driver_worker.warm_up_model()
+        self.driver_worker.initialize_cache(num_gpu_blocks, num_cpu_blocks)
 
     def execute_model(
-        self,
-        seq_group_metadata_list: List[SequenceGroupMetadata],
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
-    ) -> SamplerOutput:
-        output = self.driver_worker.execute_model(
-            seq_group_metadata_list=seq_group_metadata_list,
-            blocks_to_swap_in=blocks_to_swap_in,
-            blocks_to_swap_out=blocks_to_swap_out,
-            blocks_to_copy=blocks_to_copy,
-        )
+            self,
+            execute_model_req: ExecuteModelRequest) -> List[SamplerOutput]:
+        output = self.driver_worker.execute_model(execute_model_req)
         return output
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -149,7 +133,7 @@ class GPUExecutor(ExecutorBase):
         assert lora_id > 0, "lora_id must be greater than 0."
         return self.driver_worker.remove_lora(lora_id)
 
-    def list_loras(self) -> List[int]:
+    def list_loras(self) -> Set[int]:
         return self.driver_worker.list_loras()
 
     def check_health(self) -> None:
@@ -162,20 +146,8 @@ class GPUExecutorAsync(GPUExecutor, ExecutorAsyncBase):
 
     async def execute_model_async(
         self,
-        seq_group_metadata_list: List[SequenceGroupMetadata],
-        blocks_to_swap_in: Dict[int, int],
-        blocks_to_swap_out: Dict[int, int],
-        blocks_to_copy: Dict[int, List[int]],
-    ) -> SamplerOutput:
-        output = await make_async(self.driver_worker.execute_model)(
-            seq_group_metadata_list=seq_group_metadata_list,
-            blocks_to_swap_in=blocks_to_swap_in,
-            blocks_to_swap_out=blocks_to_swap_out,
-            blocks_to_copy=blocks_to_copy,
-        )
+        execute_model_req: ExecuteModelRequest,
+    ) -> List[SamplerOutput]:
+        output = await make_async(self.driver_worker.execute_model
+                                  )(execute_model_req=execute_model_req, )
         return output
-
-    async def check_health_async(self) -> None:
-        # GPUExecutor will always be healthy as long as
-        # it's running.
-        return
