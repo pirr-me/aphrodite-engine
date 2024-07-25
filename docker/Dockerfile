@@ -17,7 +17,7 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 
 RUN python3 -m pip install --no-cache-dir --upgrade pip
 
-RUN git clone https://github.com/PygmalionAI/aphrodite-engine.git /tmp/aphrodite-engine \
+RUN git clone -b rc_054 https://github.com/pirr-me/aphrodite-engine.git /tmp/aphrodite-engine \
     && mv /tmp/aphrodite-engine/* . \
     && rm -fr /tmp/aphrodite-engine \
     && chmod +x docker/entrypoint.sh
@@ -27,7 +27,7 @@ ENV CUDA_HOME=/usr/local/cuda
 
 ENV HF_HOME=/tmp
 ENV NUMBA_CACHE_DIR=$HF_HOME/numba_cache
-ENV TORCH_CUDA_ARCH_LIST="6.1 7.0 7.5 8.0 8.6 8.9 9.0+PTX"
+ENV TORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
 RUN python3 -m pip install --no-cache-dir -e .
 
 # Entrypoint exec form doesn't do variable substitution automatically ($HOME)
@@ -35,6 +35,6 @@ ENTRYPOINT ["/app/aphrodite-engine/docker/entrypoint.sh"]
 
 EXPOSE 7860
 
-USER 1000:0
+#USER 1000:0
 
 VOLUME ["/tmp"]
