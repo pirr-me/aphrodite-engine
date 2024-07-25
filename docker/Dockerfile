@@ -22,10 +22,6 @@ RUN git clone -b rc_054 https://github.com/pirr-me/aphrodite-engine.git /tmp/aph
     && rm -fr /tmp/aphrodite-engine \
     && chmod +x docker/entrypoint.sh
 
-# Allow build servers to limit ninja build jobs. For reference
-# see https://github.com/PygmalionAI/aphrodite-engine/wiki/1.-Installation#build-from-source
-ARG MAX_JOBS
-ENV MAX_JOBS=${MAX_JOBS}
 
 # Export the CUDA_HOME variable correctly
 ENV CUDA_HOME=/usr/local/cuda
